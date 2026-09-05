@@ -1,5 +1,5 @@
 /*
- * UART console for esp-can-rx.
+ * UART console for esp-can-rx (FreeRTOS-aware).
  *
  * Commands:
  *   help
@@ -11,6 +11,8 @@
  *   can clear
  *   can filter <id|off>
  *   can send [-e] <id> <hex-bytes...>
+ *
+ * "can send" enqueues to can_tx_task (does not call esp_now_send inline).
  */
 
 #include <stdio.h>
@@ -21,6 +23,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
 
 #include "esp_check.h"
 #include "esp_console.h"
@@ -33,6 +37,7 @@
 #include "esp_wifi.h"
 
 #include "can_cli.h"
+#include "freertos_app.h"
 
 static const char *TAG = "can_cli";
 
@@ -47,6 +52,8 @@ typedef struct {
 static stored_frame_t s_ring[FRAME_RING_SIZE];
 static uint32_t s_total;
 static SemaphoreHandle_t s_lock;
+static EventGroupHandle_t s_events;
+static QueueHandle_t s_tx_queue;
 
 static uint32_t s_rx_ok;
 static uint32_t s_rx_drop;
@@ -59,6 +66,7 @@ static bool s_peer_valid;
 static uint32_t s_tx_seq;
 static uint32_t s_tx_ok;
 static uint32_t s_tx_fail;
+static uint32_t s_tx_queue_fail;
 
 static void lock(void)
 {
@@ -99,6 +107,36 @@ static void print_frame(const can_espnow_frame_t *f, int64_t ts_us)
     printf("\n");
 }
 
+void can_cli_note_drop(void)
+{
+    lock();
+    s_rx_drop++;
+    unlock();
+}
+
+void can_cli_note_tx_result(bool ok)
+{
+    lock();
+    if (ok) {
+        s_tx_ok++;
+    } else {
+        s_tx_fail++;
+    }
+    unlock();
+}
+
+bool can_cli_get_peer(uint8_t mac_out[6])
+{
+    bool ok = false;
+    lock();
+    if (s_peer_valid) {
+        memcpy(mac_out, s_peer_mac, ESP_NOW_ETH_ALEN);
+        ok = true;
+    }
+    unlock();
+    return ok;
+}
+
 void can_cli_on_frame(const can_espnow_frame_t *frame, const uint8_t src_mac[6])
 {
     if (!frame) {
@@ -127,19 +165,24 @@ void can_cli_on_frame(const can_espnow_frame_t *frame, const uint8_t src_mac[6])
     int64_t ts = s_ring[(s_total - 1) % FRAME_RING_SIZE].ts_us;
     unlock();
 
-    if (learn && !esp_now_is_peer_exist(learned_mac)) {
-        esp_now_peer_info_t peer = {0};
-        memcpy(peer.peer_addr, learned_mac, ESP_NOW_ETH_ALEN);
-        peer.channel = CONFIG_EXAMPLE_ESPNOW_CHANNEL;
-        peer.ifidx = WIFI_IF_STA;
-        peer.encrypt = false;
-        esp_err_t err = esp_now_add_peer(&peer);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Learned TX peer %02X:%02X:%02X:%02X:%02X:%02X",
-                     learned_mac[0], learned_mac[1], learned_mac[2],
-                     learned_mac[3], learned_mac[4], learned_mac[5]);
-        } else {
-            ESP_LOGW(TAG, "add peer failed: %s", esp_err_to_name(err));
+    if (learn) {
+        if (s_events) {
+            xEventGroupSetBits(s_events, APP_EVT_PEER_LEARNED);
+        }
+        if (!esp_now_is_peer_exist(learned_mac)) {
+            esp_now_peer_info_t peer = {0};
+            memcpy(peer.peer_addr, learned_mac, ESP_NOW_ETH_ALEN);
+            peer.channel = CONFIG_EXAMPLE_ESPNOW_CHANNEL;
+            peer.ifidx = WIFI_IF_STA;
+            peer.encrypt = false;
+            esp_err_t err = esp_now_add_peer(&peer);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Learned TX peer %02X:%02X:%02X:%02X:%02X:%02X",
+                         learned_mac[0], learned_mac[1], learned_mac[2],
+                         learned_mac[3], learned_mac[4], learned_mac[5]);
+            } else {
+                ESP_LOGW(TAG, "add peer failed: %s", esp_err_to_name(err));
+            }
         }
     }
 
@@ -214,6 +257,9 @@ static int cmd_peer(int argc, char **argv)
     memcpy(s_peer_mac, mac, 6);
     s_peer_valid = true;
     unlock();
+    if (s_events) {
+        xEventGroupSetBits(s_events, APP_EVT_PEER_LEARNED);
+    }
     printf("已设置对端 TX MAC: %s\n", argv[1]);
     return 0;
 }
@@ -224,16 +270,16 @@ static int cmd_can_stats(int argc, char **argv)
     (void)argv;
     lock();
     uint32_t rx = s_rx_ok, drop = s_rx_drop, total = s_total;
-    uint32_t tx_ok = s_tx_ok, tx_fail = s_tx_fail;
+    uint32_t tx_ok = s_tx_ok, tx_fail = s_tx_fail, tx_qfail = s_tx_queue_fail;
     bool watch = s_watch;
     bool fen = s_filter_en;
     uint32_t fid = s_filter_id;
     unlock();
 
-    printf("接收成功=%lu  本地丢弃=%lu  缓冲总数=%lu\n",
+    printf("接收成功=%lu  队列丢弃=%lu  缓冲总数=%lu\n",
            (unsigned long)rx, (unsigned long)drop, (unsigned long)total);
-    printf("回传成功=%lu  回传失败=%lu\n",
-           (unsigned long)tx_ok, (unsigned long)tx_fail);
+    printf("回传成功=%lu  回传失败=%lu  入队失败=%lu\n",
+           (unsigned long)tx_ok, (unsigned long)tx_fail, (unsigned long)tx_qfail);
     printf("watch=%s  filter=%s",
            watch ? "on" : "off",
            fen ? "" : "off");
@@ -396,37 +442,24 @@ static int cmd_can_send(int argc, char **argv)
         printf("未设置对端 MAC，请先: peer AA:BB:CC:DD:EE:FF\n");
         return 1;
     }
-    uint8_t peer[6];
-    memcpy(peer, s_peer_mac, 6);
     pkt.seq = s_tx_seq++;
     unlock();
 
-    if (!esp_now_is_peer_exist(peer)) {
-        esp_now_peer_info_t info = {0};
-        memcpy(info.peer_addr, peer, 6);
-        info.channel = CONFIG_EXAMPLE_ESPNOW_CHANNEL;
-        info.ifidx = WIFI_IF_STA;
-        info.encrypt = false;
-        esp_err_t add_err = esp_now_add_peer(&info);
-        if (add_err != ESP_OK) {
-            printf("添加 peer 失败: %s\n", esp_err_to_name(add_err));
-            return 1;
-        }
-    }
-
-    esp_err_t err = esp_now_send(peer, (const uint8_t *)&pkt, sizeof(pkt));
-    if (err != ESP_OK) {
-        lock();
-        s_tx_fail++;
-        unlock();
-        printf("发送失败: %s\n", esp_err_to_name(err));
+    if (!s_tx_queue) {
+        printf("内部错误: TX 队列未就绪\n");
         return 1;
     }
 
-    lock();
-    s_tx_ok++;
-    unlock();
-    printf("已回传至 TX: id=0x%lX dlc=%u\n", (unsigned long)pkt.id, pkt.dlc);
+    /* Hand off to can_tx_task — keeps REPL responsive under Wi-Fi load. */
+    if (xQueueSend(s_tx_queue, &pkt, pdMS_TO_TICKS(100)) != pdTRUE) {
+        lock();
+        s_tx_queue_fail++;
+        unlock();
+        printf("回传入队失败（队列满）\n");
+        return 1;
+    }
+
+    printf("已入队回传: id=0x%lX dlc=%u\n", (unsigned long)pkt.id, pkt.dlc);
     return 0;
 }
 
@@ -476,9 +509,11 @@ static void register_commands(void)
     }
 }
 
-
-esp_err_t can_cli_start(void)
+esp_err_t can_cli_start(EventGroupHandle_t events, QueueHandle_t tx_queue)
 {
+    s_events = events;
+    s_tx_queue = tx_queue;
+
     s_lock = xSemaphoreCreateMutex();
     if (!s_lock) {
         return ESP_ERR_NO_MEM;
@@ -489,12 +524,21 @@ esp_err_t can_cli_start(void)
     unsigned int b[6];
     if (sscanf(CONFIG_EXAMPLE_ESPNOW_PEER_MAC, "%02x:%02x:%02x:%02x:%02x:%02x",
                &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
-        for (int i = 0; i < 6; i++) def_mac[i] = (uint8_t)b[i];
+        for (int i = 0; i < 6; i++) {
+            def_mac[i] = (uint8_t)b[i];
+        }
         bool nonzero = false;
-        for (int i = 0; i < 6; i++) if (def_mac[i]) nonzero = true;
+        for (int i = 0; i < 6; i++) {
+            if (def_mac[i]) {
+                nonzero = true;
+            }
+        }
         if (nonzero) {
             memcpy(s_peer_mac, def_mac, 6);
             s_peer_valid = true;
+            if (s_events) {
+                xEventGroupSetBits(s_events, APP_EVT_PEER_LEARNED);
+            }
             esp_now_peer_info_t peer = {0};
             memcpy(peer.peer_addr, def_mac, 6);
             peer.channel = CONFIG_EXAMPLE_ESPNOW_CHANNEL;
@@ -518,8 +562,7 @@ esp_err_t can_cli_start(void)
     esp_console_register_help_command();
     register_commands();
 
-    /* Use REPL task provided by esp_console. */
     ESP_RETURN_ON_ERROR(esp_console_start_repl(repl), TAG, "start repl");
-    ESP_LOGI(TAG, "Console ready");
+    ESP_LOGI(TAG, "Console ready (CLI prio via esp_console REPL task)");
     return ESP_OK;
 }

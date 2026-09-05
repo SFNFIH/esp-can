@@ -1,5 +1,11 @@
 /*
- * esp-can-tx — vehicle CAN -> ESP-NOW + SoftAP web monitor (ESP32-S3)
+ * esp-can-tx — vehicle CAN -> ESP-NOW + SoftAP web (ESP32-S3)
+ *
+ * FreeRTOS pipeline:
+ *   TWAI ISR  --notify-->  can_rx_task  --queues-->  espnow_tx / web_feed
+ *   ESP-NOW RX ISR -------> inject_queue --> can_inject_task
+ *   Soft timer (1 Hz) ----> publish web stats
+ *   Event group -----------> WIFI / ESP-NOW / TWAI ready bits
  */
 
 #include <stdio.h>
@@ -11,6 +17,8 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/event_groups.h"
+#include "freertos/timers.h"
 
 #include "esp_check.h"
 #include "esp_log.h"
@@ -26,6 +34,7 @@
 #include "esp_twai_onchip.h"
 
 #include "can_espnow_proto.h"
+#include "freertos_app.h"
 #include "web_monitor.h"
 
 #define TWAI_TX_GPIO    CONFIG_EXAMPLE_TWAI_TX_GPIO
@@ -39,6 +48,7 @@ static const char *TAG = "esp_can_tx";
 
 typedef struct {
     uint32_t id;
+    uint32_t seq;
     uint8_t dlc;
     uint8_t flags;
     uint8_t data[CAN_ESPNOW_MAX_DATA];
@@ -53,25 +63,29 @@ typedef struct {
     twai_node_handle_t node_hdl;
     twai_pool_slot_t *rx_pool;
     SemaphoreHandle_t free_pool_sem;
-    SemaphoreHandle_t rx_ready_sem;
-    QueueHandle_t fwd_queue;
     int write_idx;
     int read_idx;
     int pool_depth;
+    TaskHandle_t can_rx_task;
 } twai_gateway_ctx_t;
 
 static twai_gateway_ctx_t s_gw;
-static uint8_t s_peer_mac[ESP_NOW_ETH_ALEN];
-static SemaphoreHandle_t s_espnow_lock;
+static EventGroupHandle_t s_app_events;
+static QueueHandle_t s_espnow_queue;
+static QueueHandle_t s_web_queue;
 static QueueHandle_t s_inject_queue;
+static SemaphoreHandle_t s_espnow_lock;
+static TimerHandle_t s_stats_timer;
+
+static uint8_t s_peer_mac[ESP_NOW_ETH_ALEN];
 static uint32_t s_seq;
-static uint32_t s_rx_count;
-static uint32_t s_fwd_ok;
-static uint32_t s_fwd_fail;
-static uint32_t s_drop_count;
-static uint32_t s_inject_ok;
-static uint32_t s_inject_fail;
-static uint32_t s_inject_drop;
+static volatile uint32_t s_rx_count;
+static volatile uint32_t s_fwd_ok;
+static volatile uint32_t s_fwd_fail;
+static volatile uint32_t s_drop_count;
+static volatile uint32_t s_inject_ok;
+static volatile uint32_t s_inject_fail;
+static volatile uint32_t s_inject_drop;
 
 static int parse_mac_str(const char *str, uint8_t mac[ESP_NOW_ETH_ALEN])
 {
@@ -101,6 +115,12 @@ static void publish_stats(void)
         .drop_count = s_drop_count,
     };
     web_monitor_set_stats(&st);
+}
+
+static void stats_timer_cb(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+    publish_stats();
 }
 
 static void espnow_send_cb(const esp_now_send_info_t *info, esp_now_send_status_t status)
@@ -155,6 +175,7 @@ static esp_err_t wifi_ap_espnow_init(void)
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap), TAG, "ap config");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
     ESP_RETURN_ON_ERROR(esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE), TAG, "channel");
+    xEventGroupSetBits(s_app_events, APP_EVT_WIFI_READY);
 
     uint8_t ap_mac[6], sta_mac[6];
     ESP_RETURN_ON_ERROR(esp_wifi_get_mac(WIFI_IF_AP, ap_mac), TAG, "ap mac");
@@ -167,6 +188,7 @@ static esp_err_t wifi_ap_espnow_init(void)
         return ESP_ERR_INVALID_ARG;
     }
     log_mac("ESP-NOW peer:", s_peer_mac);
+    xEventGroupSetBits(s_app_events, APP_EVT_PEER_CONFIGURED);
 
     ESP_RETURN_ON_ERROR(esp_now_init(), TAG, "espnow");
     ESP_RETURN_ON_ERROR(esp_now_register_send_cb(espnow_send_cb), TAG, "send cb");
@@ -186,6 +208,7 @@ static esp_err_t wifi_ap_espnow_init(void)
         return ESP_ERR_NO_MEM;
     }
     xSemaphoreGive(s_espnow_lock);
+    xEventGroupSetBits(s_app_events, APP_EVT_ESPNOW_READY);
 
     ESP_LOGI(TAG, "SoftAP SSID='%s' pass='%s' ch=%d",
              CONFIG_EXAMPLE_WIFI_AP_SSID, CONFIG_EXAMPLE_WIFI_AP_PASSWORD, WIFI_CHANNEL);
@@ -239,6 +262,7 @@ static bool IRAM_ATTR twai_on_state_change_cb(twai_node_handle_t handle,
     return false;
 }
 
+/* ISR: fill pool slot, wake can_rx_task via Task Notification (no busy poll). */
 static bool IRAM_ATTR twai_on_rx_cb(twai_node_handle_t handle,
                                     const twai_rx_done_event_data_t *edata,
                                     void *user_ctx)
@@ -260,7 +284,10 @@ static bool IRAM_ATTR twai_on_rx_cb(twai_node_handle_t handle,
 
     ctx->write_idx = (ctx->write_idx + 1) % ctx->pool_depth;
     s_rx_count++;
-    xSemaphoreGiveFromISR(ctx->rx_ready_sem, &woken);
+
+    if (ctx->can_rx_task) {
+        vTaskNotifyGiveFromISR(ctx->can_rx_task, &woken);
+    }
     return woken == pdTRUE;
 }
 
@@ -269,10 +296,8 @@ static esp_err_t twai_gateway_init(twai_gateway_ctx_t *ctx)
     memset(ctx, 0, sizeof(*ctx));
     ctx->pool_depth = CAN_QUEUE_LEN;
     ctx->free_pool_sem = xSemaphoreCreateCounting(ctx->pool_depth, ctx->pool_depth);
-    ctx->rx_ready_sem = xSemaphoreCreateCounting(ctx->pool_depth, 0);
-    ctx->fwd_queue = xQueueCreate(ctx->pool_depth, sizeof(can_queued_frame_t));
     ctx->rx_pool = calloc(ctx->pool_depth, sizeof(twai_pool_slot_t));
-    if (!ctx->free_pool_sem || !ctx->rx_ready_sem || !ctx->fwd_queue || !ctx->rx_pool) {
+    if (!ctx->free_pool_sem || !ctx->rx_pool) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -311,6 +336,7 @@ static esp_err_t twai_gateway_init(twai_gateway_ctx_t *ctx)
     };
     ESP_RETURN_ON_ERROR(twai_node_register_event_callbacks(ctx->node_hdl, &cbs, ctx), TAG, "cbs");
     ESP_RETURN_ON_ERROR(twai_node_enable(ctx->node_hdl), TAG, "enable");
+    xEventGroupSetBits(s_app_events, APP_EVT_TWAI_READY);
 
     ESP_LOGI(TAG, "TWAI ready TX=%d RX=%d bitrate=%d listen_only=%d",
              TWAI_TX_GPIO, TWAI_RX_GPIO, TWAI_BITRATE,
@@ -323,70 +349,75 @@ static esp_err_t twai_gateway_init(twai_gateway_ctx_t *ctx)
     return ESP_OK;
 }
 
-static void can_consume_task(void *arg)
+static void queue_or_drop(QueueHandle_t q, const can_queued_frame_t *qf)
+{
+    if (xQueueSend(q, qf, 0) != pdTRUE) {
+        s_drop_count++;
+    }
+}
+
+/*
+ * Highest-priority consumer: drain TWAI pool under TaskNotify, fan-out to
+ * ESP-NOW and web queues so wireless / HTTP never block CAN ingest.
+ */
+static void can_rx_task(void *arg)
 {
     twai_gateway_ctx_t *ctx = (twai_gateway_ctx_t *)arg;
+
+    xEventGroupWaitBits(s_app_events, APP_EVT_ALL_READY, pdFALSE, pdTRUE, portMAX_DELAY);
+    ESP_LOGI(TAG, "can_rx_task running (prio=%d)", APP_PRIO_CAN_RX);
+
     while (1) {
-        if (xSemaphoreTake(ctx->rx_ready_sem, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
+        /* Each ISR Give increments the notification count (= frames ready). */
+        uint32_t n = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        while (n--) {
+            twai_frame_t *frame = &ctx->rx_pool[ctx->read_idx].frame;
+            can_queued_frame_t qf = {0};
+            qf.id = frame->header.id;
+            qf.seq = s_seq++;
+            qf.dlc = (uint8_t)frame->header.dlc;
+            if (qf.dlc > CAN_ESPNOW_MAX_DATA) {
+                qf.dlc = CAN_ESPNOW_MAX_DATA;
+            }
+            if (frame->header.ide) {
+                qf.flags |= CAN_ESPNOW_FLAG_EXT;
+            }
+            if (frame->header.rtr) {
+                qf.flags |= CAN_ESPNOW_FLAG_RTR;
+            }
+            if (frame->buffer && qf.dlc) {
+                memcpy(qf.data, frame->buffer, qf.dlc);
+            }
 
-        twai_frame_t *frame = &ctx->rx_pool[ctx->read_idx].frame;
-        can_queued_frame_t qf = {0};
-        qf.id = frame->header.id;
-        qf.dlc = (uint8_t)frame->header.dlc;
-        if (qf.dlc > CAN_ESPNOW_MAX_DATA) {
-            qf.dlc = CAN_ESPNOW_MAX_DATA;
-        }
-        if (frame->header.ide) {
-            qf.flags |= CAN_ESPNOW_FLAG_EXT;
-        }
-        if (frame->header.rtr) {
-            qf.flags |= CAN_ESPNOW_FLAG_RTR;
-        }
-        if (frame->buffer && qf.dlc) {
-            memcpy(qf.data, frame->buffer, qf.dlc);
-        }
+            ctx->read_idx = (ctx->read_idx + 1) % ctx->pool_depth;
+            xSemaphoreGive(ctx->free_pool_sem);
 
-        ctx->read_idx = (ctx->read_idx + 1) % ctx->pool_depth;
-        xSemaphoreGive(ctx->free_pool_sem);
-
-        if (xQueueSend(ctx->fwd_queue, &qf, 0) != pdTRUE) {
-            s_drop_count++;
+            queue_or_drop(s_espnow_queue, &qf);
+            queue_or_drop(s_web_queue, &qf);
         }
     }
 }
 
-static void forward_task(void *arg)
+static void espnow_tx_task(void *arg)
 {
-    twai_gateway_ctx_t *ctx = (twai_gateway_ctx_t *)arg;
+    (void)arg;
     can_queued_frame_t frame;
 
+    xEventGroupWaitBits(s_app_events, APP_EVT_ESPNOW_READY | APP_EVT_PEER_CONFIGURED,
+                        pdFALSE, pdTRUE, portMAX_DELAY);
+    ESP_LOGI(TAG, "espnow_tx_task running (prio=%d)", APP_PRIO_ESPNOW_TX);
+
     while (1) {
-        if (xQueueReceive(ctx->fwd_queue, &frame, portMAX_DELAY) != pdTRUE) {
+        if (xQueueReceive(s_espnow_queue, &frame, portMAX_DELAY) != pdTRUE) {
             continue;
         }
 
-        uint32_t seq = s_seq++;
-        can_monitor_frame_t mon = {
-            .id = frame.id,
-            .dlc = frame.dlc,
-            .flags = frame.flags,
-            .seq = seq,
-            .ts_us = esp_timer_get_time(),
-        };
-        memcpy(mon.data, frame.data, CAN_ESPNOW_MAX_DATA);
-        web_monitor_publish_frame(&mon);
-
-        esp_err_t err = espnow_forward_frame(&frame, seq);
+        esp_err_t err = espnow_forward_frame(&frame, frame.seq);
         uint32_t total = s_fwd_ok + s_fwd_fail;
         if ((LOG_EVERY_N == 0) || (total % LOG_EVERY_N == 0)) {
             ESP_LOGI(TAG,
-                     "CAN id=0x%lX dlc=%u data=%02X %02X %02X %02X %02X %02X %02X %02X | "
-                     "rx=%lu ok=%lu fail=%lu drop=%lu (%s)",
+                     "CAN id=0x%lX dlc=%u | rx=%lu ok=%lu fail=%lu drop=%lu (%s)",
                      (unsigned long)frame.id, frame.dlc,
-                     frame.data[0], frame.data[1], frame.data[2], frame.data[3],
-                     frame.data[4], frame.data[5], frame.data[6], frame.data[7],
                      (unsigned long)s_rx_count, (unsigned long)s_fwd_ok,
                      (unsigned long)s_fwd_fail, (unsigned long)s_drop_count,
                      esp_err_to_name(err));
@@ -394,10 +425,37 @@ static void forward_task(void *arg)
     }
 }
 
-static void inject_task(void *arg)
+static void web_feed_task(void *arg)
+{
+    (void)arg;
+    can_queued_frame_t frame;
+
+    ESP_LOGI(TAG, "web_feed_task running (prio=%d)", APP_PRIO_WEB_FEED);
+
+    while (1) {
+        if (xQueueReceive(s_web_queue, &frame, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        can_monitor_frame_t mon = {
+            .id = frame.id,
+            .dlc = frame.dlc,
+            .flags = frame.flags,
+            .seq = frame.seq,
+            .ts_us = esp_timer_get_time(),
+        };
+        memcpy(mon.data, frame.data, CAN_ESPNOW_MAX_DATA);
+        web_monitor_publish_frame(&mon);
+    }
+}
+
+static void can_inject_task(void *arg)
 {
     (void)arg;
     can_espnow_frame_t pkt;
+
+    xEventGroupWaitBits(s_app_events, APP_EVT_TWAI_READY, pdFALSE, pdTRUE, portMAX_DELAY);
+    ESP_LOGI(TAG, "can_inject_task running (prio=%d)", APP_PRIO_CAN_INJECT);
 
     while (1) {
         if (xQueueReceive(s_inject_queue, &pkt, portMAX_DELAY) != pdTRUE) {
@@ -439,18 +497,9 @@ static void inject_task(void *arg)
     }
 }
 
-static void stats_task(void *arg)
-{
-    (void)arg;
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        publish_stats();
-    }
-}
-
 void app_main(void)
 {
-    printf("=================== ESP-CAN-TX (CAN + ESP-NOW + Web) ===================\n");
+    printf("=================== ESP-CAN-TX (FreeRTOS pipeline) ===================\n");
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -458,18 +507,33 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
+    s_app_events = xEventGroupCreate();
+    s_espnow_queue = xQueueCreate(CAN_QUEUE_LEN, sizeof(can_queued_frame_t));
+    s_web_queue = xQueueCreate(CAN_QUEUE_LEN, sizeof(can_queued_frame_t));
     s_inject_queue = xQueueCreate(16, sizeof(can_espnow_frame_t));
-    assert(s_inject_queue);
+    assert(s_app_events && s_espnow_queue && s_web_queue && s_inject_queue);
 
     ESP_ERROR_CHECK(wifi_ap_espnow_init());
     ESP_ERROR_CHECK(web_monitor_start());
     ESP_ERROR_CHECK(twai_gateway_init(&s_gw));
 
-    assert(xTaskCreate(can_consume_task, "can_consume", 4096, &s_gw, 12, NULL) == pdPASS);
-    assert(xTaskCreate(forward_task, "forward", 4096, &s_gw, 10, NULL) == pdPASS);
-    assert(xTaskCreate(inject_task, "inject", 4096, NULL, 11, NULL) == pdPASS);
-    assert(xTaskCreate(stats_task, "stats", 3072, NULL, 5, NULL) == pdPASS);
+    assert(xTaskCreate(can_rx_task, "can_rx", APP_STACK_CAN_RX, &s_gw,
+                       APP_PRIO_CAN_RX, &s_gw.can_rx_task) == pdPASS);
+    assert(xTaskCreate(espnow_tx_task, "espnow_tx", APP_STACK_ESPNOW_TX, NULL,
+                       APP_PRIO_ESPNOW_TX, NULL) == pdPASS);
+    assert(xTaskCreate(web_feed_task, "web_feed", APP_STACK_WEB_FEED, NULL,
+                       APP_PRIO_WEB_FEED, NULL) == pdPASS);
+    assert(xTaskCreate(can_inject_task, "can_inject", APP_STACK_CAN_INJECT, NULL,
+                       APP_PRIO_CAN_INJECT, NULL) == pdPASS);
 
+    s_stats_timer = xTimerCreate("stats", pdMS_TO_TICKS(APP_STATS_PERIOD_MS),
+                                 pdTRUE, NULL, stats_timer_cb);
+    assert(s_stats_timer);
+    assert(xTimerStart(s_stats_timer, 0) == pdPASS);
+
+    EventBits_t ready = xEventGroupWaitBits(s_app_events, APP_EVT_ALL_READY,
+                                            pdFALSE, pdTRUE, pdMS_TO_TICKS(5000));
+    ESP_LOGI(TAG, "App ready bits=0x%lx", (unsigned long)ready);
     ESP_LOGI(TAG, "Running. Join SoftAP and open http://192.168.4.1/");
 #if CONFIG_EXAMPLE_TWAI_LISTEN_ONLY
     ESP_LOGW(TAG, "Listen-only ON: RX 'can send' frames will NOT be injected to vehicle CAN");

@@ -1,11 +1,11 @@
 # ESP-CAN（ESP32-S3）
 
-基于 ESP-IDF 的 **TWAI（CAN）+ ESP-NOW** 工程：从汽车 CAN 无线转发，并在车端提供网页实时查看。
+基于 ESP-IDF 的 **TWAI（CAN）+ ESP-NOW** 工程：从汽车 CAN 无线转发，车端可网页监视，接收端可用串口命令行查看/回传。两端按 FreeRTOS 任务管线拆分实时路径与慢路径。
 
 | 工程 | 作用 |
 |------|------|
-| `esp-can-tx` | 连接汽车 CAN；ESP-NOW 转发；开启热点供手机/电脑网页监视 |
-| `esp-can-rx` | 接收 ESP-NOW 封装后的 CAN 帧并打印 |
+| `esp-can-tx` | 连接汽车 CAN；ESP-NOW 转发；SoftAP 网页监视；可接收 RX 回传并注入 CAN |
+| `esp-can-rx` | 接收 ESP-NOW CAN 帧；UART 命令行查看/过滤/回传 |
 
 ## 数据流
 
@@ -14,41 +14,87 @@
     │
     ▼
 esp-can-tx
-    ├── ESP-NOW ──────────────► esp-can-rx
+    ├── ESP-NOW ──────────────► esp-can-rx（串口 CLI）
+    │        ◄────────────────  can send 回传（可选注入总线）
     └── SoftAP 网页监视
-         手机/电脑连接热点
-         打开 http://192.168.4.1/
+         手机/电脑打开 http://192.168.4.1/
 ```
 
-## 网页监视（esp-can-tx）
+## FreeRTOS 任务模型
 
-1. 烧录并运行 `esp-can-tx`
-2. 手机或电脑连接 Wi-Fi：
-   - 名称：`ESP-CAN-TX`
-   - 密码：`espcan123`
-3. 浏览器打开：**http://192.168.4.1/**
-4. 页面每 200ms 拉取最新 CAN 帧，可暂停/清空/过滤扩展帧
+### esp-can-tx
 
-热点名称与密码可在 `menuconfig` → **ESP-CAN-TX Configuration** 中修改。
+| 机制 | 用途 |
+|------|------|
+| Task Notify（ISR→任务） | TWAI RX ISR 唤醒 `can_rx`，尽快腾出硬件缓冲 |
+| Queue 扇出 | `can_rx` 同时投递 ESP-NOW / Web，互不阻塞 |
+| Event Group | Wi-Fi / ESP-NOW / TWAI 就绪后再跑业务任务 |
+| Soft Timer 1Hz | 刷新网页统计，避免单独占一个阻塞延时任务 |
+| Binary Semaphore | 串行化 `esp_now_send` 与发送完成回调 |
 
-## 硬件说明
+优先级（高→低）：`can_rx` → `espnow_tx` → `web_feed` / `can_inject`
 
-### esp-can-tx（车端）
+### esp-can-rx
 
-1. ESP32-S3 + CAN 收发器（如 SN65HVD230）
-2. 收发器 CAN_H / CAN_L 并入车辆 CAN（注意安全与法规；默认只听，不 ACK）
-3. 默认引脚：TX=GPIO4，RX=GPIO5
-4. 默认波特率：**500000**
+| 机制 | 用途 |
+|------|------|
+| Queue + Task Notify | ESP-NOW 回调入队并唤醒 `can_rx` |
+| Queue | CLI `can send` 入队，由 `can_tx` 真正发 ESP-NOW |
+| Event Group | Wi-Fi / ESP-NOW 就绪；对端 MAC 学习置位 |
+| Mutex | 保护帧环缓冲与 peer MAC |
+| Soft Timer 1Hz | 心跳统计日志 |
 
-### esp-can-rx（接收端）
+优先级（高→低）：`can_rx` → CLI(REPL) → `can_tx`
 
-- 给 ESP32-S3 供电即可接收 ESP-NOW
+## esp-can-rx 命令行
 
-## ESP-NOW 配对
+烧录后用串口监视器（115200）进入提示符 `esp-can-rx>`。
 
-1. 先运行 `esp-can-rx`，记下串口打印的 STA MAC  
-2. 在 `esp-can-tx` 填写对端 MAC（或联调用广播 `FF:FF:FF:FF:FF:FF`）  
-3. 两端信道一致（默认 1，与 SoftAP 共用）
+| 命令 | 说明 |
+|------|------|
+| `help` | 帮助 |
+| `mac` | 显示本机 STA MAC |
+| `peer` | 查看已学习/已设置的 TX MAC |
+| `peer AA:BB:CC:DD:EE:FF` | 手动设置 TX MAC（用于回传） |
+| `can stats` | 接收/回传统计 |
+| `can last [n]` | 查看最近 n 帧（默认 20） |
+| `can watch on\|off` | 实时打印收到的帧 |
+| `can filter <id\|off>` | 按 ID 过滤，例如 `can filter 0x123` |
+| `can clear` | 清空本地缓冲 |
+| `can send [-e] <id> <hex...>` | 回传一帧给 TX（入队，由 `can_tx` 发送） |
+
+示例：
+
+```text
+can watch on
+can last 50
+can filter 0x7E0
+can send 0x7E0 02 10 01
+can send -e 0x18DAF110 02 10 01
+```
+
+说明：
+
+1. 收到 TX 帧后会自动学习对端 MAC；也可手动 `peer ...`
+2. `can send` 需要 TX 关闭 listen-only，才会真正发到汽车 CAN  
+   （`menuconfig` → `EXAMPLE_TWAI_LISTEN_ONLY` 取消勾选）
+
+## esp-can-tx 网页监视
+
+1. 连接 Wi-Fi：`ESP-CAN-TX` / `espcan123`
+2. 浏览器打开：http://192.168.4.1/
+
+## 硬件
+
+### esp-can-tx
+
+- ESP32-S3 + CAN 收发器（如 SN65HVD230）
+- 默认 GPIO：TX=4，RX=5；波特率 500000
+- 默认 listen-only（只听不 ACK）
+
+### esp-can-rx
+
+- ESP32-S3 供电即可（ESP-NOW）
 
 ## 编译烧录
 
@@ -59,13 +105,4 @@ cd esp-can-rx && idf.py set-target esp32s3 && idf.py build flash monitor
 cd esp-can-tx && idf.py set-target esp32s3 && idf.py build flash monitor
 ```
 
-## 常用配置
-
-| 配置项 | 默认 |
-|--------|------|
-| SoftAP SSID / 密码 | ESP-CAN-TX / espcan123 |
-| TWAI TX/RX GPIO | 4 / 5 |
-| TWAI 波特率 | 500000 |
-| Listen-only | 开启 |
-| Wi-Fi / ESP-NOW 信道 | 1 |
-| ESP-NOW 对端 MAC | FF:FF:FF:FF:FF:FF |
+先运行 RX，把串口打印的 STA MAC 填到 TX 的 `EXAMPLE_ESPNOW_PEER_MAC`；两端信道默认均为 1。
