@@ -5,13 +5,13 @@ menu "ESP-CAN-RX Configuration"
         range 1 13
         default 1
         help
-            Must match esp-can-tx.
+            Must match esp-can-tx SoftAP / ESP-NOW channel.
 
-    config EXAMPLE_LOG_EVERY_N_FRAMES
-        int "Log every N received frames (0 = every frame)"
-        range 0 10000
-        default 1
+    config EXAMPLE_ESPNOW_PEER_MAC
+        string "Default TX peer MAC (optional)"
+        default "00:00:00:00:00:00"
         help
-            Reduce UART spam when the vehicle bus is busy.
+            If set to a non-zero MAC, CLI can send without waiting to learn peer.
+            You can also set it at runtime: peer AA:BB:CC:DD:EE:FF
 
 endmenu

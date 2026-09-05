@@ -1,8 +1,5 @@
 /*
- * esp-can-rx — ESP-NOW receiver for vehicle CAN frames (ESP32-S3)
- *
- * Receives can_espnow_frame_t packets forwarded by esp-can-tx and logs them.
- * Extend this file later to drive actuators / local CAN / UART as needed.
+ * esp-can-rx — receive vehicle CAN frames via ESP-NOW + UART CLI (ESP32-S3)
  */
 
 #include <stdio.h>
@@ -23,17 +20,20 @@
 #include "nvs_flash.h"
 
 #include "can_espnow_proto.h"
+#include "can_cli.h"
 
 #define ESPNOW_CHANNEL      CONFIG_EXAMPLE_ESPNOW_CHANNEL
-#define LOG_EVERY_N         CONFIG_EXAMPLE_LOG_EVERY_N_FRAMES
 #define RX_QUEUE_LEN        64
 
 static const char *TAG = "esp_can_rx";
 
 static QueueHandle_t s_rx_queue;
-static uint32_t s_rx_count;
 static uint32_t s_rx_invalid;
-static uint32_t s_rx_drop;
+
+typedef struct {
+    can_espnow_frame_t frame;
+    uint8_t src_mac[ESP_NOW_ETH_ALEN];
+} rx_item_t;
 
 static void log_mac(const char *label, const uint8_t *mac)
 {
@@ -54,11 +54,14 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
         return;
     }
 
-    if (xQueueSend(s_rx_queue, pkt, 0) != pdTRUE) {
-        s_rx_drop++;
+    rx_item_t item = {0};
+    item.frame = *pkt;
+    memcpy(item.src_mac, info->src_addr, ESP_NOW_ETH_ALEN);
+
+    if (xQueueSend(s_rx_queue, &item, 0) != pdTRUE) {
+        /* Still notify CLI drop via a zero-length path: count only. */
         return;
     }
-    s_rx_count++;
 }
 
 static esp_err_t wifi_espnow_init(void)
@@ -75,12 +78,11 @@ static esp_err_t wifi_espnow_init(void)
 
     uint8_t local_mac[ESP_NOW_ETH_ALEN];
     ESP_RETURN_ON_ERROR(esp_wifi_get_mac(WIFI_IF_STA, local_mac), TAG, "get mac");
-    log_mac("Local STA MAC (set this on esp-can-tx peer):", local_mac);
+    log_mac("本机 STA MAC（填到 esp-can-tx 对端）:", local_mac);
 
     ESP_RETURN_ON_ERROR(esp_now_init(), TAG, "espnow init");
     ESP_RETURN_ON_ERROR(esp_now_register_recv_cb(espnow_recv_cb), TAG, "recv cb");
 
-    /* Allow broadcast / any peer; TX can send broadcast during bring-up. */
     esp_now_peer_info_t peer = {0};
     memset(peer.peer_addr, 0xFF, ESP_NOW_ETH_ALEN);
     peer.channel = ESPNOW_CHANNEL;
@@ -97,47 +99,19 @@ static esp_err_t wifi_espnow_init(void)
 static void rx_task(void *arg)
 {
     (void)arg;
-    can_espnow_frame_t frame;
+    rx_item_t item;
 
     while (1) {
-        if (xQueueReceive(s_rx_queue, &frame, portMAX_DELAY) != pdTRUE) {
+        if (xQueueReceive(s_rx_queue, &item, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-
-        bool log_it = (LOG_EVERY_N == 0) || (s_rx_count % (LOG_EVERY_N ? LOG_EVERY_N : 1) == 0);
-        if (log_it) {
-            ESP_LOGI(TAG,
-                     "ESPNOW RX seq=%lu id=0x%lX dlc=%u flags=0x%02x "
-                     "data=%02X %02X %02X %02X %02X %02X %02X %02X | "
-                     "ok=%lu invalid=%lu drop=%lu",
-                     (unsigned long)frame.seq,
-                     (unsigned long)frame.id,
-                     frame.dlc,
-                     frame.flags,
-                     frame.data[0], frame.data[1], frame.data[2], frame.data[3],
-                     frame.data[4], frame.data[5], frame.data[6], frame.data[7],
-                     (unsigned long)s_rx_count,
-                     (unsigned long)s_rx_invalid,
-                     (unsigned long)s_rx_drop);
-        }
-    }
-}
-
-static void stats_task(void *arg)
-{
-    (void)arg;
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        ESP_LOGI(TAG, "stats ok=%lu invalid=%lu drop=%lu",
-                 (unsigned long)s_rx_count,
-                 (unsigned long)s_rx_invalid,
-                 (unsigned long)s_rx_drop);
+        can_cli_on_frame(&item.frame, item.src_mac);
     }
 }
 
 void app_main(void)
 {
-    printf("=================== ESP-CAN-RX (ESP-NOW CAN sink) ===================\n");
+    printf("=================== ESP-CAN-RX (ESP-NOW + CLI) ===================\n");
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -145,16 +119,12 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
-    s_rx_queue = xQueueCreate(RX_QUEUE_LEN, sizeof(can_espnow_frame_t));
+    s_rx_queue = xQueueCreate(RX_QUEUE_LEN, sizeof(rx_item_t));
     assert(s_rx_queue);
 
     ESP_ERROR_CHECK(wifi_espnow_init());
+    assert(xTaskCreate(rx_task, "espnow_rx", 4096, NULL, 10, NULL) == pdPASS);
+    ESP_ERROR_CHECK(can_cli_start());
 
-    BaseType_t ok;
-    ok = xTaskCreate(rx_task, "espnow_rx", 4096, NULL, 10, NULL);
-    assert(ok == pdPASS);
-    ok = xTaskCreate(stats_task, "stats", 3072, NULL, 5, NULL);
-    assert(ok == pdPASS);
-
-    ESP_LOGI(TAG, "Waiting for CAN frames from esp-can-tx ...");
+    ESP_LOGI(TAG, "Ready. Use UART console commands (type help).");
 }

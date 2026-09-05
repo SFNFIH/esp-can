@@ -63,11 +63,15 @@ typedef struct {
 static twai_gateway_ctx_t s_gw;
 static uint8_t s_peer_mac[ESP_NOW_ETH_ALEN];
 static SemaphoreHandle_t s_espnow_lock;
+static QueueHandle_t s_inject_queue;
 static uint32_t s_seq;
 static uint32_t s_rx_count;
 static uint32_t s_fwd_ok;
 static uint32_t s_fwd_fail;
 static uint32_t s_drop_count;
+static uint32_t s_inject_ok;
+static uint32_t s_inject_fail;
+static uint32_t s_inject_drop;
 
 static int parse_mac_str(const char *str, uint8_t mac[ESP_NOW_ETH_ALEN])
 {
@@ -112,6 +116,21 @@ static void espnow_send_cb(const esp_now_send_info_t *info, esp_now_send_status_
     }
 }
 
+static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)
+{
+    (void)info;
+    if (!data || len != (int)sizeof(can_espnow_frame_t)) {
+        return;
+    }
+    const can_espnow_frame_t *pkt = (const can_espnow_frame_t *)data;
+    if (!can_espnow_frame_valid(pkt)) {
+        return;
+    }
+    if (!s_inject_queue || xQueueSend(s_inject_queue, pkt, 0) != pdTRUE) {
+        s_inject_drop++;
+    }
+}
+
 static esp_err_t wifi_ap_espnow_init(void)
 {
     ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "netif");
@@ -151,6 +170,7 @@ static esp_err_t wifi_ap_espnow_init(void)
 
     ESP_RETURN_ON_ERROR(esp_now_init(), TAG, "espnow");
     ESP_RETURN_ON_ERROR(esp_now_register_send_cb(espnow_send_cb), TAG, "send cb");
+    ESP_RETURN_ON_ERROR(esp_now_register_recv_cb(espnow_recv_cb), TAG, "recv cb");
 
     esp_now_peer_info_t peer = {0};
     memcpy(peer.peer_addr, s_peer_mac, ESP_NOW_ETH_ALEN);
@@ -374,6 +394,51 @@ static void forward_task(void *arg)
     }
 }
 
+static void inject_task(void *arg)
+{
+    (void)arg;
+    can_espnow_frame_t pkt;
+
+    while (1) {
+        if (xQueueReceive(s_inject_queue, &pkt, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+#if CONFIG_EXAMPLE_TWAI_LISTEN_ONLY
+        ESP_LOGW(TAG, "Ignore inject id=0x%lX (listen-only on; disable EXAMPLE_TWAI_LISTEN_ONLY to TX)",
+                 (unsigned long)pkt.id);
+        s_inject_fail++;
+        continue;
+#else
+        uint8_t data[CAN_ESPNOW_MAX_DATA] = {0};
+        if (pkt.dlc > CAN_ESPNOW_MAX_DATA) {
+            pkt.dlc = CAN_ESPNOW_MAX_DATA;
+        }
+        memcpy(data, pkt.data, pkt.dlc);
+
+        twai_frame_t frame = {
+            .header = {
+                .id = pkt.id,
+                .dlc = pkt.dlc,
+                .ide = (pkt.flags & CAN_ESPNOW_FLAG_EXT) ? 1 : 0,
+                .rtr = (pkt.flags & CAN_ESPNOW_FLAG_RTR) ? 1 : 0,
+            },
+            .buffer = data,
+            .buffer_len = pkt.dlc,
+        };
+
+        esp_err_t err = twai_node_transmit(s_gw.node_hdl, &frame, 100);
+        if (err == ESP_OK) {
+            s_inject_ok++;
+            ESP_LOGI(TAG, "Injected to CAN id=0x%lX dlc=%u", (unsigned long)pkt.id, pkt.dlc);
+        } else {
+            s_inject_fail++;
+            ESP_LOGW(TAG, "Inject failed id=0x%lX: %s", (unsigned long)pkt.id, esp_err_to_name(err));
+        }
+#endif
+    }
+}
+
 static void stats_task(void *arg)
 {
     (void)arg;
@@ -393,13 +458,20 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
+    s_inject_queue = xQueueCreate(16, sizeof(can_espnow_frame_t));
+    assert(s_inject_queue);
+
     ESP_ERROR_CHECK(wifi_ap_espnow_init());
     ESP_ERROR_CHECK(web_monitor_start());
     ESP_ERROR_CHECK(twai_gateway_init(&s_gw));
 
     assert(xTaskCreate(can_consume_task, "can_consume", 4096, &s_gw, 12, NULL) == pdPASS);
     assert(xTaskCreate(forward_task, "forward", 4096, &s_gw, 10, NULL) == pdPASS);
+    assert(xTaskCreate(inject_task, "inject", 4096, NULL, 11, NULL) == pdPASS);
     assert(xTaskCreate(stats_task, "stats", 3072, NULL, 5, NULL) == pdPASS);
 
     ESP_LOGI(TAG, "Running. Join SoftAP and open http://192.168.4.1/");
+#if CONFIG_EXAMPLE_TWAI_LISTEN_ONLY
+    ESP_LOGW(TAG, "Listen-only ON: RX 'can send' frames will NOT be injected to vehicle CAN");
+#endif
 }

@@ -24,7 +24,8 @@ menu "ESP-CAN-TX Configuration"
         bool "Listen-only mode on vehicle CAN bus"
         default y
         help
-            Recommended when tapping an existing car bus so this node does not ACK.
+            Recommended when only sniffing a car bus (node does not ACK).
+            Disable this if you want esp-can-rx 'can send' to inject frames onto the bus.
 
     config EXAMPLE_WIFI_AP_SSID
         string "SoftAP SSID"
