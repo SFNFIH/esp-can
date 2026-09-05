@@ -19,12 +19,12 @@ extern "C" {
 #define CAN_ESPNOW_FLAG_RTR     (1u << 1)
 
 typedef struct __attribute__((packed)) {
-    uint8_t  magic;     /* CAN_ESPNOW_MAGIC */
-    uint8_t  version;   /* CAN_ESPNOW_VERSION */
-    uint8_t  flags;     /* CAN_ESPNOW_FLAG_* */
-    uint8_t  dlc;       /* 0..8 */
-    uint32_t id;        /* 11-bit or 29-bit CAN ID */
-    uint32_t seq;       /* sequence for drop/dup detection */
+    uint8_t  magic;
+    uint8_t  version;
+    uint8_t  flags;
+    uint8_t  dlc;
+    uint32_t id;
+    uint32_t seq;
     uint8_t  data[CAN_ESPNOW_MAX_DATA];
 } can_espnow_frame_t;
 

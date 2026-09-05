@@ -6,7 +6,6 @@ menu "ESP-CAN-TX Configuration"
         default 4
         help
             GPIO for TWAI TX to the transceiver.
-            Keep wired even in listen-only mode on most transceiver boards.
 
     config EXAMPLE_TWAI_RX_GPIO
         int "TWAI RX GPIO Num"
@@ -27,26 +26,37 @@ menu "ESP-CAN-TX Configuration"
         help
             Recommended when tapping an existing car bus so this node does not ACK.
 
+    config EXAMPLE_WIFI_AP_SSID
+        string "SoftAP SSID"
+        default "ESP-CAN-TX"
+        help
+            Wi-Fi hotspot name for phone/PC web monitor.
+
+    config EXAMPLE_WIFI_AP_PASSWORD
+        string "SoftAP password"
+        default "espcan123"
+        help
+            At least 8 characters for WPA2. Leave shorter only if you accept open AP.
+
     config EXAMPLE_ESPNOW_CHANNEL
-        int "ESP-NOW Wi-Fi channel"
+        int "Wi-Fi / ESP-NOW channel"
         range 1 13
         default 1
         help
-            Must match esp-can-rx.
+            SoftAP and ESP-NOW share this channel. Must match esp-can-rx.
 
     config EXAMPLE_ESPNOW_PEER_MAC
         string "ESP-NOW peer MAC (esp-can-rx)"
         default "FF:FF:FF:FF:FF:FF"
         help
             Destination MAC of esp-can-rx, e.g. AA:BB:CC:DD:EE:FF.
-            Default broadcast is convenient for bring-up.
 
     config EXAMPLE_CAN_QUEUE_LEN
         int "CAN RX / forward queue length"
         range 8 256
         default 64
         help
-            Frames buffered between TWAI ISR and ESP-NOW sender.
+            Frames buffered between TWAI ISR and forwarder task.
 
     config EXAMPLE_LOG_EVERY_N_FRAMES
         int "Log every N forwarded frames (0 = every frame)"
