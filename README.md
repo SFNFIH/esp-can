@@ -7,6 +7,11 @@
 | `esp-can-tx` | 连接汽车 CAN；ESP-NOW 转发；SoftAP 网页监视；可接收 RX 回传并注入 CAN |
 | `esp-can-rx` | 接收 ESP-NOW CAN 帧；UART 命令行查看/过滤/回传 |
 
+各工程超详细手册（本总览保留）：
+
+- [`esp-can-tx/RM.md`](esp-can-tx/RM.md)
+- [`esp-can-rx/RM.md`](esp-can-rx/RM.md)
+
 ## 工程目录（ESP-IDF 标准布局）
 
 每个子工程（`esp-can-tx` / `esp-can-rx`）结构如下：
