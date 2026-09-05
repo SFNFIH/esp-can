@@ -7,6 +7,44 @@
 | `esp-can-tx` | 连接汽车 CAN；ESP-NOW 转发；SoftAP 网页监视；可接收 RX 回传并注入 CAN |
 | `esp-can-rx` | 接收 ESP-NOW CAN 帧；UART 命令行查看/过滤/回传 |
 
+## 工程目录（ESP-IDF 标准布局）
+
+每个子工程（`esp-can-tx` / `esp-can-rx`）结构如下：
+
+```text
+esp-can-tx/   （或 esp-can-rx/）
+├── CMakeLists.txt
+├── sdkconfig.defaults          # 默认配置（编译后生成 sdkconfig）
+├── bootloader_components/      # 可选：自定义 bootloader 组件
+├── components/                 # 本地组件
+│   ├── can_espnow_proto/       # 共享协议头
+│   │   ├── CMakeLists.txt
+│   │   └── include/can_espnow_proto.h
+│   ├── freertos_app/           # 任务优先级 / 事件位
+│   │   ├── CMakeLists.txt
+│   │   └── include/freertos_app.h
+│   ├── web_monitor/            # 仅 tx：网页监视
+│   │   ├── CMakeLists.txt
+│   │   ├── Kconfig
+│   │   ├── web_monitor.c
+│   │   └── include/web_monitor.h
+│   └── can_cli/                # 仅 rx：串口 CLI
+│       ├── CMakeLists.txt
+│       ├── Kconfig
+│       ├── can_cli.c
+│       └── include/can_cli.h
+├── main/
+│   ├── CMakeLists.txt
+│   ├── idf_component.yml
+│   ├── Kconfig.projbuild
+│   └── main.c                  # app_main 入口
+├── managed_components/         # 由组件管理器自动生成
+├── dependencies.lock           # 由组件管理器自动生成
+└── build/                      # 编译输出
+```
+
+`sdkconfig` / `dependencies.lock` / `managed_components/` / `build/` 由工具生成，已在 `.gitignore` 中忽略。
+
 ## 数据流
 
 ```

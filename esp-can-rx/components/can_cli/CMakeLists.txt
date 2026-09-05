@@ -1,13 +1,11 @@
 idf_component_register(
-    SRCS "main.c"
-    INCLUDE_DIRS "."
+    SRCS "can_cli.c"
+    INCLUDE_DIRS "include"
     REQUIRES
         can_espnow_proto
         freertos_app
-        can_cli
-        nvs_flash
+        console
         esp_wifi
-        esp_netif
-        esp_event
         esp_timer
+        nvs_flash
 )

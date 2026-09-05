@@ -1,6 +1,6 @@
 /*
  * Shared CAN-over-ESP-NOW frame format for esp-can-tx / esp-can-rx.
- * Keep both copies identical.
+ * Keep both projects' components/can_espnow_proto identical.
  */
 #pragma once
 
