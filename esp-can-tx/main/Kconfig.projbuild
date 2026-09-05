@@ -1,17 +1,58 @@
-menu "Example Configuration"
+menu "ESP-CAN-TX Configuration"
 
     config EXAMPLE_TWAI_TX_GPIO
         int "TWAI TX GPIO Num"
         range 0 SOC_GPIO_OUT_RANGE_MAX
         default 4
         help
-            GPIO number for TWAI TX to transceiver.
+            GPIO for TWAI TX to the transceiver.
+            Keep wired even in listen-only mode on most transceiver boards.
 
     config EXAMPLE_TWAI_RX_GPIO
         int "TWAI RX GPIO Num"
         range 0 SOC_GPIO_IN_RANGE_MAX
         default 5
         help
-            GPIO number for TWAI RX from transceiver.
+            GPIO for TWAI RX from the transceiver.
+
+    config EXAMPLE_TWAI_BITRATE
+        int "TWAI bitrate (bps)"
+        default 500000
+        help
+            Vehicle CAN is commonly 500000 or 250000.
+
+    config EXAMPLE_TWAI_LISTEN_ONLY
+        bool "Listen-only mode on vehicle CAN bus"
+        default y
+        help
+            Recommended when tapping an existing car bus so this node does not ACK.
+
+    config EXAMPLE_ESPNOW_CHANNEL
+        int "ESP-NOW Wi-Fi channel"
+        range 1 13
+        default 1
+        help
+            Must match esp-can-rx.
+
+    config EXAMPLE_ESPNOW_PEER_MAC
+        string "ESP-NOW peer MAC (esp-can-rx)"
+        default "FF:FF:FF:FF:FF:FF"
+        help
+            Destination MAC of esp-can-rx, e.g. AA:BB:CC:DD:EE:FF.
+            Default broadcast is convenient for bring-up.
+
+    config EXAMPLE_CAN_QUEUE_LEN
+        int "CAN RX / forward queue length"
+        range 8 256
+        default 64
+        help
+            Frames buffered between TWAI ISR and ESP-NOW sender.
+
+    config EXAMPLE_LOG_EVERY_N_FRAMES
+        int "Log every N forwarded frames (0 = every frame)"
+        range 0 10000
+        default 50
+        help
+            Reduce UART spam on a busy vehicle bus.
 
 endmenu

@@ -1,58 +1,241 @@
 /*
- * SPDX-FileCopyrightText: 2025-2026 Espressif Systems (Shanghai) CO LTD
+ * esp-can-tx — vehicle CAN -> ESP-NOW gateway (ESP32-S3)
  *
- * SPDX-License-Identifier: Apache-2.0
+ * Receives frames from the automotive CAN (TWAI) bus and forwards them to
+ * esp-can-rx over ESP-NOW.
  *
- * Based on ESP-IDF examples/peripherals/twai/twai_network/twai_sender
- * Target: ESP32-S3
+ * TWAI usage follows ESP-IDF examples/peripherals/twai/twai_network/twai_listen_only.
  */
 
 #include <stdio.h>
 #include <string.h>
-#include <sys/param.h>
+#include <stdlib.h>
+#include <assert.h>
+
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
+
+#include "esp_check.h"
 #include "esp_log.h"
-#include "esp_timer.h"
+#include "esp_mac.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "esp_now.h"
+#include "nvs_flash.h"
+
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 
-#define TWAI_TX_GPIO            CONFIG_EXAMPLE_TWAI_TX_GPIO
-#define TWAI_RX_GPIO            CONFIG_EXAMPLE_TWAI_RX_GPIO
-#define TWAI_QUEUE_DEPTH        10
-#define TWAI_BITRATE            1000000
+#include "can_espnow_proto.h"
 
-/* Message IDs */
-#define TWAI_DATA_ID            0x100
-#define TWAI_HEARTBEAT_ID       0x7FF
-#define TWAI_EMERGENCY_ID       0x080
-#define TWAI_DATA_LEN           1000
+#define TWAI_TX_GPIO        CONFIG_EXAMPLE_TWAI_TX_GPIO
+#define TWAI_RX_GPIO        CONFIG_EXAMPLE_TWAI_RX_GPIO
+#define TWAI_BITRATE        CONFIG_EXAMPLE_TWAI_BITRATE
+#define CAN_QUEUE_LEN       CONFIG_EXAMPLE_CAN_QUEUE_LEN
+#define ESPNOW_CHANNEL      CONFIG_EXAMPLE_ESPNOW_CHANNEL
+#define LOG_EVERY_N         CONFIG_EXAMPLE_LOG_EVERY_N_FRAMES
 
 static const char *TAG = "esp_can_tx";
 
 typedef struct {
+    uint32_t id;
+    uint8_t  dlc;
+    uint8_t  flags;
+    uint8_t  data[CAN_ESPNOW_MAX_DATA];
+} can_queued_frame_t;
+
+typedef struct {
     twai_frame_t frame;
     uint8_t data[TWAI_FRAME_MAX_LEN];
-} twai_sender_data_t;
+} twai_pool_slot_t;
 
-static IRAM_ATTR bool twai_sender_tx_done_callback(twai_node_handle_t handle, const twai_tx_done_event_data_t *edata, void *user_ctx)
+typedef struct {
+    twai_node_handle_t node_hdl;
+    twai_pool_slot_t *rx_pool;
+    SemaphoreHandle_t free_pool_sem;
+    SemaphoreHandle_t rx_ready_sem;
+    QueueHandle_t fwd_queue;
+    int write_idx;
+    int read_idx;
+    int pool_depth;
+} twai_gateway_ctx_t;
+
+static twai_gateway_ctx_t s_gw;
+static uint8_t s_peer_mac[ESP_NOW_ETH_ALEN];
+static SemaphoreHandle_t s_espnow_send_lock;
+static uint32_t s_seq;
+static uint32_t s_rx_count;
+static uint32_t s_fwd_ok;
+static uint32_t s_fwd_fail;
+static uint32_t s_drop_count;
+
+static int parse_mac_str(const char *str, uint8_t mac[ESP_NOW_ETH_ALEN])
 {
-    if (!edata->is_tx_success) {
-        ESP_EARLY_LOGW(TAG, "Failed to transmit message, ID: 0x%X", edata->done_tx_frame->header.id);
+    unsigned int b[6];
+    if (sscanf(str, "%02x:%02x:%02x:%02x:%02x:%02x",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+        return -1;
     }
+    for (int i = 0; i < 6; i++) {
+        mac[i] = (uint8_t)b[i];
+    }
+    return 0;
+}
+
+static void log_mac(const char *label, const uint8_t *mac)
+{
+    ESP_LOGI(TAG, "%s %02X:%02X:%02X:%02X:%02X:%02X",
+             label, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
+{
+    (void)tx_info;
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        s_fwd_ok++;
+    } else {
+        s_fwd_fail++;
+    }
+    if (s_espnow_send_lock) {
+        xSemaphoreGive(s_espnow_send_lock);
+    }
+}
+
+static esp_err_t wifi_espnow_init(void)
+{
+    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "netif");
+    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "event loop");
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "wifi storage");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "wifi mode");
+    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE), TAG, "channel");
+
+    uint8_t local_mac[ESP_NOW_ETH_ALEN];
+    ESP_RETURN_ON_ERROR(esp_wifi_get_mac(WIFI_IF_STA, local_mac), TAG, "get mac");
+    log_mac("Local STA MAC:", local_mac);
+
+    if (parse_mac_str(CONFIG_EXAMPLE_ESPNOW_PEER_MAC, s_peer_mac) != 0) {
+        ESP_LOGE(TAG, "Invalid peer MAC: %s", CONFIG_EXAMPLE_ESPNOW_PEER_MAC);
+        return ESP_ERR_INVALID_ARG;
+    }
+    log_mac("ESP-NOW peer (esp-can-rx):", s_peer_mac);
+
+    ESP_RETURN_ON_ERROR(esp_now_init(), TAG, "espnow init");
+    ESP_RETURN_ON_ERROR(esp_now_register_send_cb(espnow_send_cb), TAG, "send cb");
+
+    esp_now_peer_info_t peer = {0};
+    memcpy(peer.peer_addr, s_peer_mac, ESP_NOW_ETH_ALEN);
+    peer.channel = ESPNOW_CHANNEL;
+    peer.ifidx = WIFI_IF_STA;
+    peer.encrypt = false;
+    if (!esp_now_is_peer_exist(s_peer_mac)) {
+        ESP_RETURN_ON_ERROR(esp_now_add_peer(&peer), TAG, "add peer");
+    }
+
+    s_espnow_send_lock = xSemaphoreCreateBinary();
+    if (!s_espnow_send_lock) {
+        return ESP_ERR_NO_MEM;
+    }
+    xSemaphoreGive(s_espnow_send_lock);
+
+    ESP_LOGI(TAG, "ESP-NOW ready, channel=%d", ESPNOW_CHANNEL);
+    return ESP_OK;
+}
+
+static esp_err_t espnow_forward_frame(const can_queued_frame_t *qf)
+{
+    can_espnow_frame_t pkt = {
+        .magic = CAN_ESPNOW_MAGIC,
+        .version = CAN_ESPNOW_VERSION,
+        .flags = qf->flags,
+        .dlc = qf->dlc,
+        .id = qf->id,
+        .seq = s_seq++,
+    };
+    memcpy(pkt.data, qf->data, CAN_ESPNOW_MAX_DATA);
+
+    if (xSemaphoreTake(s_espnow_send_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+        s_fwd_fail++;
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = esp_now_send(s_peer_mac, (const uint8_t *)&pkt, sizeof(pkt));
+    if (err != ESP_OK) {
+        s_fwd_fail++;
+        xSemaphoreGive(s_espnow_send_lock);
+    }
+    return err;
+}
+
+static bool IRAM_ATTR twai_on_error_cb(twai_node_handle_t handle,
+                                       const twai_error_event_data_t *edata,
+                                       void *user_ctx)
+{
+    (void)handle;
+    (void)user_ctx;
+    ESP_EARLY_LOGW(TAG, "TWAI bus error: 0x%lx", (unsigned long)edata->err_flags.val);
     return false;
 }
 
-static IRAM_ATTR bool twai_sender_on_error_callback(twai_node_handle_t handle, const twai_error_event_data_t *edata, void *user_ctx)
+static bool IRAM_ATTR twai_on_state_change_cb(twai_node_handle_t handle,
+                                              const twai_state_change_event_data_t *edata,
+                                              void *user_ctx)
 {
-    ESP_EARLY_LOGW(TAG, "TWAI node error: 0x%x", edata->err_flags.val);
+    (void)handle;
+    (void)user_ctx;
+    static const char *names[] = {"error_active", "error_warning", "error_passive", "bus_off"};
+    ESP_EARLY_LOGI(TAG, "TWAI state %s -> %s", names[edata->old_sta], names[edata->new_sta]);
     return false;
 }
 
-void app_main(void)
+static bool IRAM_ATTR twai_on_rx_cb(twai_node_handle_t handle,
+                                    const twai_rx_done_event_data_t *edata,
+                                    void *user_ctx)
 {
-    twai_node_handle_t sender_node = NULL;
-    printf("===================ESP-CAN-TX (ESP32-S3) Starting...===================\n");
+    (void)edata;
+    twai_gateway_ctx_t *ctx = (twai_gateway_ctx_t *)user_ctx;
+    BaseType_t woken = pdFALSE;
+
+    if (xSemaphoreTakeFromISR(ctx->free_pool_sem, &woken) != pdTRUE) {
+        s_drop_count++;
+        return woken == pdTRUE;
+    }
+
+    twai_pool_slot_t *slot = &ctx->rx_pool[ctx->write_idx];
+    if (twai_node_receive_from_isr(handle, &slot->frame) != ESP_OK) {
+        xSemaphoreGiveFromISR(ctx->free_pool_sem, &woken);
+        return woken == pdTRUE;
+    }
+
+    ctx->write_idx = (ctx->write_idx + 1) % ctx->pool_depth;
+    s_rx_count++;
+    xSemaphoreGiveFromISR(ctx->rx_ready_sem, &woken);
+    return woken == pdTRUE;
+}
+
+static esp_err_t twai_gateway_init(twai_gateway_ctx_t *ctx)
+{
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->pool_depth = CAN_QUEUE_LEN;
+
+    ctx->free_pool_sem = xSemaphoreCreateCounting(ctx->pool_depth, ctx->pool_depth);
+    ctx->rx_ready_sem = xSemaphoreCreateCounting(ctx->pool_depth, 0);
+    ctx->fwd_queue = xQueueCreate(ctx->pool_depth, sizeof(can_queued_frame_t));
+    ctx->rx_pool = calloc(ctx->pool_depth, sizeof(twai_pool_slot_t));
+    if (!ctx->free_pool_sem || !ctx->rx_ready_sem || !ctx->fwd_queue || !ctx->rx_pool) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    for (int i = 0; i < ctx->pool_depth; i++) {
+        ctx->rx_pool[i].frame.buffer = ctx->rx_pool[i].data;
+        ctx->rx_pool[i].frame.buffer_len = sizeof(ctx->rx_pool[i].data);
+    }
 
     twai_onchip_node_config_t node_config = {
         .io_cfg = {
@@ -61,69 +244,138 @@ void app_main(void)
             .quanta_clk_out = GPIO_NUM_NC,
             .bus_off_indicator = GPIO_NUM_NC,
         },
-        .bit_timing = {
-            .bitrate = TWAI_BITRATE,
-        },
-        .fail_retry_cnt = 3,
-        .tx_queue_depth = TWAI_QUEUE_DEPTH,
+        .bit_timing.bitrate = TWAI_BITRATE,
+        .timestamp_resolution_hz = 1000000,
+#if CONFIG_EXAMPLE_TWAI_LISTEN_ONLY
+        .flags.enable_listen_only = true,
+#endif
     };
 
-    ESP_ERROR_CHECK(twai_new_node_onchip(&node_config, &sender_node));
+    ESP_RETURN_ON_ERROR(twai_new_node_onchip(&node_config, &ctx->node_hdl), TAG, "twai new");
 
-    twai_event_callbacks_t callbacks = {
-        .on_tx_done = twai_sender_tx_done_callback,
-        .on_error = twai_sender_on_error_callback,
+    /* Open filter: accept all standard IDs. */
+    twai_mask_filter_config_t open_filter = {
+        .id = 0,
+        .mask = 0,
+        .is_ext = false,
     };
-    ESP_ERROR_CHECK(twai_node_register_event_callbacks(sender_node, &callbacks, NULL));
+    ESP_RETURN_ON_ERROR(twai_node_config_mask_filter(ctx->node_hdl, 0, &open_filter), TAG, "filter");
 
-    ESP_ERROR_CHECK(twai_node_enable(sender_node));
-    ESP_LOGI(TAG, "TWAI TX started successfully");
-    ESP_LOGI(TAG, "Sending messages with IDs: 0x%03X (data), 0x%03X (heartbeat)", TWAI_DATA_ID, TWAI_HEARTBEAT_ID);
+    twai_event_callbacks_t cbs = {
+        .on_rx_done = twai_on_rx_cb,
+        .on_error = twai_on_error_cb,
+        .on_state_change = twai_on_state_change_cb,
+    };
+    ESP_RETURN_ON_ERROR(twai_node_register_event_callbacks(ctx->node_hdl, &cbs, ctx), TAG, "cbs");
+    ESP_RETURN_ON_ERROR(twai_node_enable(ctx->node_hdl), TAG, "enable");
+
+    ESP_LOGI(TAG, "TWAI ready: TX=GPIO%d RX=GPIO%d bitrate=%d listen_only=%d",
+             TWAI_TX_GPIO, TWAI_RX_GPIO, TWAI_BITRATE,
+#if CONFIG_EXAMPLE_TWAI_LISTEN_ONLY
+             1
+#else
+             0
+#endif
+            );
+    return ESP_OK;
+}
+
+static void can_consume_task(void *arg)
+{
+    twai_gateway_ctx_t *ctx = (twai_gateway_ctx_t *)arg;
 
     while (1) {
-        uint64_t timestamp = esp_timer_get_time();
-        twai_frame_t tx_frame = {
-            .header.id = TWAI_HEARTBEAT_ID,
-            .buffer = (uint8_t *)&timestamp,
-            .buffer_len = sizeof(timestamp),
-        };
-        ESP_ERROR_CHECK(twai_node_transmit(sender_node, &tx_frame, 500));
-        ESP_LOGI(TAG, "Sending heartbeat message: %lld", timestamp);
-        ESP_ERROR_CHECK(twai_node_transmit_wait_all_done(sender_node, -1));
-
-        if ((timestamp / 1000000) % 10 == 0) {
-            int num_frames = howmany(TWAI_DATA_LEN, TWAI_FRAME_MAX_LEN);
-            twai_sender_data_t *data = (twai_sender_data_t *)calloc(num_frames, sizeof(twai_sender_data_t));
-            assert(data != NULL);
-            ESP_LOGI(TAG, "Sending packet of %d bytes in %d frames", TWAI_DATA_LEN, num_frames);
-            for (int i = 0; i < num_frames; i++) {
-                data[i].frame.header.id = TWAI_DATA_ID;
-                data[i].frame.buffer = data[i].data;
-                data[i].frame.buffer_len = TWAI_FRAME_MAX_LEN;
-                memset(data[i].data, i, TWAI_FRAME_MAX_LEN);
-                ESP_ERROR_CHECK(twai_node_transmit(sender_node, &data[i].frame, 500));
-            }
-
-            twai_frame_t emergency_frame = {
-                .header.id = TWAI_EMERGENCY_ID,
-                .tx_queue_priority = 10,
-            };
-            ESP_LOGI(TAG, "Inserting Emergency message: 0x%03X", TWAI_EMERGENCY_ID);
-            ESP_ERROR_CHECK(twai_node_transmit(sender_node, &emergency_frame, 500));
-
-            ESP_ERROR_CHECK(twai_node_transmit_wait_all_done(sender_node, -1));
-            free(data);
+        if (xSemaphoreTake(ctx->rx_ready_sem, portMAX_DELAY) != pdTRUE) {
+            continue;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        twai_node_status_t status;
-        twai_node_get_info(sender_node, &status, NULL);
-        if (status.state == TWAI_ERROR_BUS_OFF) {
-            ESP_LOGW(TAG, "Bus-off detected");
-            return;
+        twai_frame_t *frame = &ctx->rx_pool[ctx->read_idx].frame;
+        can_queued_frame_t qf = {0};
+
+        qf.id = frame->header.id;
+        qf.dlc = (uint8_t)frame->header.dlc;
+        if (qf.dlc > CAN_ESPNOW_MAX_DATA) {
+            qf.dlc = CAN_ESPNOW_MAX_DATA;
+        }
+        if (frame->header.ide) {
+            qf.flags |= CAN_ESPNOW_FLAG_EXT;
+        }
+        if (frame->header.rtr) {
+            qf.flags |= CAN_ESPNOW_FLAG_RTR;
+        }
+        if (frame->buffer && qf.dlc > 0) {
+            memcpy(qf.data, frame->buffer, qf.dlc);
+        }
+
+        ctx->read_idx = (ctx->read_idx + 1) % ctx->pool_depth;
+        xSemaphoreGive(ctx->free_pool_sem);
+
+        if (xQueueSend(ctx->fwd_queue, &qf, 0) != pdTRUE) {
+            s_drop_count++;
         }
     }
+}
 
-    ESP_ERROR_CHECK(twai_node_disable(sender_node));
-    ESP_ERROR_CHECK(twai_node_delete(sender_node));
+static void espnow_forward_task(void *arg)
+{
+    twai_gateway_ctx_t *ctx = (twai_gateway_ctx_t *)arg;
+    can_queued_frame_t frame;
+
+    while (1) {
+        if (xQueueReceive(ctx->fwd_queue, &frame, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        esp_err_t err = espnow_forward_frame(&frame);
+        uint32_t total = s_fwd_ok + s_fwd_fail;
+        bool log_it = (LOG_EVERY_N == 0) || (total % LOG_EVERY_N == 0);
+        if (log_it) {
+            ESP_LOGI(TAG,
+                     "CAN->ESPNOW id=0x%lX dlc=%u flags=0x%02x "
+                     "data=%02X %02X %02X %02X %02X %02X %02X %02X | "
+                     "rx=%lu ok=%lu fail=%lu drop=%lu (%s)",
+                     (unsigned long)frame.id, frame.dlc, frame.flags,
+                     frame.data[0], frame.data[1], frame.data[2], frame.data[3],
+                     frame.data[4], frame.data[5], frame.data[6], frame.data[7],
+                     (unsigned long)s_rx_count, (unsigned long)s_fwd_ok,
+                     (unsigned long)s_fwd_fail, (unsigned long)s_drop_count,
+                     esp_err_to_name(err));
+        }
+    }
+}
+
+static void stats_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        ESP_LOGI(TAG, "stats rx=%lu fwd_ok=%lu fwd_fail=%lu drop=%lu seq=%lu",
+                 (unsigned long)s_rx_count, (unsigned long)s_fwd_ok,
+                 (unsigned long)s_fwd_fail, (unsigned long)s_drop_count,
+                 (unsigned long)s_seq);
+    }
+}
+
+void app_main(void)
+{
+    printf("=================== ESP-CAN-TX (vehicle CAN -> ESP-NOW) ===================\n");
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+
+    ESP_ERROR_CHECK(wifi_espnow_init());
+    ESP_ERROR_CHECK(twai_gateway_init(&s_gw));
+
+    BaseType_t ok;
+    ok = xTaskCreate(can_consume_task, "can_consume", 4096, &s_gw, 12, NULL);
+    assert(ok == pdPASS);
+    ok = xTaskCreate(espnow_forward_task, "espnow_fwd", 4096, &s_gw, 10, NULL);
+    assert(ok == pdPASS);
+    ok = xTaskCreate(stats_task, "stats", 3072, NULL, 5, NULL);
+    assert(ok == pdPASS);
+
+    ESP_LOGI(TAG, "Gateway running. Set EXAMPLE_ESPNOW_PEER_MAC to esp-can-rx STA MAC.");
 }
